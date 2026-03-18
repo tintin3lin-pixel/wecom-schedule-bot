@@ -1,0 +1,20 @@
+name = "wecom-schedule-bot"
+main = "src/index.ts"
+compatibility_date = "2024-12-05"
+compatibility_flags = ["nodejs_compat"]
+
+# KV 命名空间（会话状态 + 图片缓冲区）
+[[kv_namespaces]]
+binding = "SESSION_KV"
+id = "REPLACE_WITH_YOUR_KV_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+
+# D1 数据库（日程数据）
+[[d1_databases]]
+binding = "DB"
+database_name = "schedule-bot-db"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# 环境变量（敏感信息用 wrangler secret 设置，不要写在这里）
+[vars]
+WECOM_AGENT_ID = "REPLACE_WITH_YOUR_AGENT_ID"
