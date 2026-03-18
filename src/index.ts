@@ -918,11 +918,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const { msg_signature, timestamp, nonce, echostr } = params;
 
     if (!env.WECOM_TOKEN) return new Response("Not configured", { status: 500 });
+    if (!echostr || !timestamp || !nonce || !msg_signature) {
+      return new Response("Missing params", { status: 400 });
+    }
 
-    const sig = await verifySignature(env.WECOM_TOKEN, timestamp, nonce, echostr);
-    if (sig !== msg_signature) return new Response("Forbidden", { status: 403 });
+    // 企业微信加密模式：签名 = sha1(sort([token, timestamp, nonce]))，不含echostr
+    const sig = await verifySignature(env.WECOM_TOKEN, timestamp, nonce);
+    if (sig !== msg_signature) {
+      // 兼容明文模式：签名含echostr
+      const sig2 = await verifySignature(env.WECOM_TOKEN, timestamp, nonce, echostr);
+      if (sig2 !== msg_signature) return new Response("Forbidden", { status: 403 });
+      // 明文模式直接返回echostr
+      return new Response(echostr);
+    }
 
-    if (env.WECOM_ENCODING_AES_KEY && echostr) {
+    // 加密模式：解密echostr后返回
+    if (env.WECOM_ENCODING_AES_KEY) {
       const decrypted = await decryptMessage(env.WECOM_ENCODING_AES_KEY, echostr);
       if (decrypted) return new Response(decrypted);
     }
