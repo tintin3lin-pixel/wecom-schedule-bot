@@ -3,17 +3,16 @@ main = "src/index.ts"
 compatibility_date = "2024-12-05"
 compatibility_flags = ["nodejs_compat"]
 
-# KV 命名空间（会话状态 + 图片缓冲区）
 [[kv_namespaces]]
 binding = "SESSION_KV"
-id = "REPLACE_WITH_YOUR_KV_ID"
-preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+id = "3dd1e59f86d64c769305363c67ff0219"
+preview_id = "3dd1e59f86d64c769305363c67ff0219"
 
-# D1 数据库（日程数据）
 [[d1_databases]]
 binding = "DB"
 database_name = "schedule-bot-db"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
+database_id = "b4bb09cf-98a6-49bf-8159-ac029f96807c"
+
 
 # 环境变量（敏感信息用 wrangler secret 设置，不要写在这里）
 [vars]
