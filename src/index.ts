@@ -1090,7 +1090,7 @@ async function handleRequest(request: Request, env: Env, ctx?: ExecutionContext)
           console.log(`[WeCom] Voice message from ${fromUser}, Recognition: "${recognition}"`);
           if (!recognition || recognition.trim() === "") {
             // Recognition 为空说明企业微信未开启语音转文字，或识别失败
-            await sendWeComReply(env, fromUser, "收到语音消息，但未能识别内容。请在企业微信后台开启"接收语音消息转文字"功能，或改用文字发送。");
+            await sendWeComReply(env, fromUser, "收到语音消息，但未能识别内容。请在企业微信后台开启【接收语音消息转文字】功能，或改用文字发送。");
             return;
           }
           const voiceText = recognition.trim();
