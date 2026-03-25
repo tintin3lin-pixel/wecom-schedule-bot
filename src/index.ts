@@ -908,7 +908,7 @@ async function handleCombinedMessage(
 
 // ==================== HTTP 请求路由 ====================
 
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function handleRequest(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
 
@@ -922,34 +922,72 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return new Response("Missing params", { status: 400 });
     }
 
-    // 企业微信加密模式：签名 = sha1(sort([token, timestamp, nonce]))，不含echostr
-    const sig = await verifySignature(env.WECOM_TOKEN, timestamp, nonce);
+    // 官方文档：加密模式下，签名 = sha1(sort(token, timestamp, nonce, msg_encrypt))
+    // 其中 msg_encrypt 就是 URL 参数中的 echostr（加密后的字符串）
+    // 参考：https://developer.work.weixin.qq.com/document/path/96211
+    const sig = await verifySignature(env.WECOM_TOKEN, timestamp, nonce, echostr);
     if (sig !== msg_signature) {
-      // 兼容明文模式：签名含echostr
-      const sig2 = await verifySignature(env.WECOM_TOKEN, timestamp, nonce, echostr);
-      if (sig2 !== msg_signature) return new Response("Forbidden", { status: 403 });
-      // 明文模式直接返回echostr
-      return new Response(echostr);
+      console.error(`[WeCom] GET signature mismatch. computed=${sig}, received=${msg_signature}`);
+      return new Response("Forbidden", { status: 403 });
     }
 
-    // 加密模式：解密echostr后返回
+    // 签名验证通过，解密 echostr 返回明文
     if (env.WECOM_ENCODING_AES_KEY) {
       const decrypted = await decryptMessage(env.WECOM_ENCODING_AES_KEY, echostr);
+      console.log(`[WeCom] GET verify: echostr decrypted length=${decrypted?.length}, preview=${decrypted?.substring(0, 50)}`);
       if (decrypted) return new Response(decrypted);
     }
+    // 兜底：无 AES Key 时直接返回（明文模式）
     return new Response(echostr);
+  }
+
+  // Debug 端点：查看最近收到的 POST body
+  if (request.method === "GET" && path === "/debug/last") {
+    const last = await env.SESSION_KV.get("debug:last_post");
+    return new Response(last || "(no data)", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
+
+  // Debug 端点：测试发送消息 API
+  if (request.method === "GET" && path === "/debug/send-test") {
+    const toUser = url.searchParams.get("to") || "LinYiZheng";
+    const { WECOM_CORP_ID: corpId, WECOM_CORP_SECRET: corpSecret, WECOM_AGENT_ID: agentId } = env;
+    const result: Record<string, unknown> = { corpId: corpId ? corpId.substring(0, 8) + "..." : "MISSING", corpSecret: corpSecret ? "SET" : "MISSING", agentId };
+    try {
+      const tokenResp = await fetch(`https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpId}&corpsecret=${corpSecret}`);
+      const tokenData = await tokenResp.json() as { access_token?: string; errcode?: number; errmsg?: string };
+      result.tokenResponse = { errcode: tokenData.errcode, errmsg: tokenData.errmsg, hasToken: !!tokenData.access_token };
+      if (tokenData.access_token) {
+        const sendResp = await fetch(`https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${tokenData.access_token}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ touser: toUser, msgtype: "text", agentid: parseInt(agentId), text: { content: "测试消息 - 机器人调试" }, safe: 0 }),
+        });
+        const sendData = await sendResp.json() as Record<string, unknown>;
+        result.sendResponse = sendData;
+      }
+    } catch (e) {
+      result.error = String(e);
+    }
+    return new Response(JSON.stringify(result, null, 2), { headers: { "Content-Type": "application/json" } });
   }
 
   // 企业微信消息接收 (POST)
   if (request.method === "POST" && (path === "/api/wecom/callback" || path === "/")) {
+    // 先读取 body（stream 只能读一次）
+    const rawXml = await request.text();
+    // 存储最近的 POST body 用于调试（只保留 2000 字符）
+    await env.SESSION_KV.put("debug:last_post", `TIME:${new Date().toISOString()}\nURL:${request.url}\nBODY:${rawXml.substring(0, 2000)}`, { expirationTtl: 3600 });
     // 立即返回 200，避免企业微信重试
     const responsePromise = new Response("success", { status: 200 });
 
     // 异步处理消息（使用 waitUntil 确保处理完成）
     const processPromise = (async () => {
       try {
-        const rawXml = await request.text();
-        if (!rawXml.trim()) return;
+        if (!rawXml.trim()) {
+          console.log("[WeCom] Empty body received");
+          return;
+        }
+        console.log("[WeCom] Raw XML length:", rawXml.length, "preview:", rawXml.substring(0, 200));
 
         // 解析外层 XML
         let msgType = parseXmlField(rawXml, "MsgType");
@@ -957,18 +995,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         let content = parseXmlField(rawXml, "Content");
         let picUrl = parseXmlField(rawXml, "PicUrl");
         let mediaId = parseXmlField(rawXml, "MediaId");
+        let recognition = parseXmlField(rawXml, "Recognition"); // 企业微信语音转文字结果
         let senderName: string | undefined = getMemberNameByWeComId(fromUser) || undefined;
 
         // 解密加密消息
         const encryptField = parseXmlField(rawXml, "Encrypt");
+        console.log("[WeCom] encryptField present:", !!encryptField, "WECOM_ENCODING_AES_KEY present:", !!env.WECOM_ENCODING_AES_KEY);
         if (encryptField && env.WECOM_ENCODING_AES_KEY) {
           const decrypted = await decryptMessage(env.WECOM_ENCODING_AES_KEY, encryptField);
-          if (!decrypted) return;
+          if (!decrypted) {
+            console.error("[WeCom] Decryption failed! encryptField length:", encryptField.length);
+            return;
+          }
+          console.log("[WeCom] Decrypted XML length:", decrypted.length, "preview:", decrypted.substring(0, 200));
           msgType = parseXmlField(decrypted, "MsgType");
           fromUser = parseXmlField(decrypted, "FromUserName");
           content = parseXmlField(decrypted, "Content");
           picUrl = parseXmlField(decrypted, "PicUrl");
           mediaId = parseXmlField(decrypted, "MediaId");
+          recognition = parseXmlField(decrypted, "Recognition");
           senderName = getMemberNameByWeComId(fromUser) || undefined;
         }
 
@@ -1040,6 +1085,30 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           return;
         }
 
+        // ==================== 语音消息 ====================
+        if (msgType === "voice") {
+          console.log(`[WeCom] Voice message from ${fromUser}, Recognition: "${recognition}"`);
+          if (!recognition || recognition.trim() === "") {
+            // Recognition 为空说明企业微信未开启语音转文字，或识别失败
+            await sendWeComReply(env, fromUser, "收到语音消息，但未能识别内容。请在企业微信后台开启"接收语音消息转文字"功能，或改用文字发送。");
+            return;
+          }
+          const voiceText = recognition.trim();
+          console.log(`[WeCom] Voice recognized text: "${voiceText}"`);
+          // 检查是否在确认流程中
+          const convCtx = await getOrCreateContext(env.SESSION_KV, fromUser);
+          const isInConfirmFlow = convCtx.state.phase === "awaiting_confirm" || convCtx.state.phase === "awaiting_batch_confirm";
+          const intent = detectUserIntent(voiceText);
+          if (!isInConfirmFlow && intent === "unknown") {
+            const isQuery = detectQueryIntent(voiceText);
+            if (!isQuery) {
+              await sendWeComReply(env, fromUser, `收到语音：「${voiceText}」\n正在识别日程...`);
+            }
+          }
+          await handleCombinedMessage(env, fromUser, voiceText, [], senderName);
+          return;
+        }
+
         // ==================== 混合消息 ====================
         if (msgType === "mixed") {
           const messageText = content.replace(/@\S+/g, "").trim();
@@ -1054,9 +1123,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
     })();
 
-    // 使用 ctx.waitUntil 确保异步处理完成（在 fetch handler 中通过 event 传递）
-    // 这里直接 await 处理（Workers 支持）
-    await processPromise;
+    // 用 ctx.waitUntil 确保异步处理在响应返回后继续运行
+    if (ctx) {
+      ctx.waitUntil(processPromise);
+    } else {
+      await processPromise;
+    }
     return responsePromise;
   }
 
@@ -1073,7 +1145,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 // ==================== Workers 入口 ====================
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env, ctx);
   },
 };
